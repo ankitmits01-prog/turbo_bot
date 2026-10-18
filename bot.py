@@ -35,7 +35,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 USER_MODE = os.getenv("MODE", "bot").lower() == "user"   # user = log in with your own account
 OWNERS = [int(x) for x in os.getenv("OWNER_IDS", "").replace(" ", "").split(",") if x]
 WORKDIR = Path(os.getenv("WORKDIR", "/root/turbo_work"))
-JOB_WORKERS = int(os.getenv("JOB_WORKERS", "2"))
+JOB_WORKERS = int(os.getenv("JOB_WORKERS", "1"))
 SETTINGS_FILE = Path(os.getenv("SETTINGS_FILE", "settings.json"))
 
 logging.basicConfig(
@@ -47,6 +47,7 @@ log = logging.getLogger("bot")
 LINK_RE = re.compile(r"(?:https?://)?t\.me/(c/)?([^/\s]+)/(\d+)(?:/(\d+))?")
 
 jobs: asyncio.Queue = asyncio.Queue()
+running: set = set()   # tasks of jobs currently in progress
 
 
 # ---------------------------------------------------------------- helpers
@@ -248,6 +249,8 @@ async def slow_transfer(client: Client, dest, msg, prog: Prog, job_dir: Path):
 
 async def run_job(client: Client, job: dict):
     status = job["status"]
+    if status is None:
+        status = await job["origin"].reply_text(f"⏳ Working on #{job['src_mid']}...", quote=False)
     prog = Prog()
     stop = asyncio.Event()
     tick = asyncio.create_task(ticker(status, prog, stop))
@@ -275,6 +278,12 @@ async def run_job(client: Client, job: dict):
         size = prog.total or 0
         avg = size / took if took else 0
         await status.edit_text(f"✅ Done: {human(size)} in {took:.0f}s (avg {human(avg)}/s)")
+    except asyncio.CancelledError:
+        try:
+            await status.edit_text("🛑 Cancelled")
+        except Exception:
+            pass
+        raise
     except Exception as e:
         log.exception("job failed")
         try:
@@ -290,10 +299,17 @@ async def run_job(client: Client, job: dict):
 async def job_worker(client: Client):
     while True:
         job = await jobs.get()
+        task = asyncio.create_task(run_job(client, job))
+        running.add(task)
         try:
-            await run_job(client, job)
+            await task
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise          # the worker itself is being shut down
         finally:
+            running.discard(task)
             jobs.task_done()
+        await asyncio.sleep(2)
 
 
 def need_dest(message) -> bool:
@@ -327,7 +343,8 @@ async def start_cmd(client, message):
         "• /batch <first_link> <last_link> : poori range\n"
         "• Koi file forward karo : destination par copy ho jayegi\n"
         "• /setdest <chat_id ya @username> : destination (bot wahan admin ho)\n"
-        "• /mydest, /cleardest, /queue"
+        "• /mydest, /cleardest, /queue\n"
+        "• /cancel : saari queue + chal rahi job band"
     )
 
 
@@ -361,6 +378,21 @@ async def queue_cmd(client, message):
     await message.reply_text(f"Queue me {jobs.qsize()} job(s) hain.")
 
 
+async def cancel_cmd(client, message):
+    dropped = 0
+    while True:
+        try:
+            jobs.get_nowait()
+            jobs.task_done()
+            dropped += 1
+        except asyncio.QueueEmpty:
+            break
+    active = list(running)
+    for t in active:
+        t.cancel()
+    await message.reply_text(f"🛑 Cancelled: {dropped} queued job(s) removed, {len(active)} running job(s) stopped.")
+
+
 async def batch_cmd(client, message):
     if need_dest(message):
         return await message.reply_text(NEED_DEST_TEXT)
@@ -375,8 +407,8 @@ async def batch_cmd(client, message):
     status = await message.reply_text(f"⏳ {hi - lo + 1} message queue kar raha hoon...", quote=True)
     dest = get_dest(message.from_user.id, message.chat.id)
     for mid in range(lo, hi + 1):
-        s = await message.reply_text(f"⏳ Queued #{mid}", quote=False)
-        await jobs.put(dict(user=message.from_user.id, status=s, src_chat=chat, src_mid=mid, dest=dest))
+        await jobs.put(dict(user=message.from_user.id, status=None, origin=message,
+                            src_chat=chat, src_mid=mid, dest=dest))
     await status.edit_text(f"✅ {hi - lo + 1} job queue me daal diye.")
 
 
@@ -418,7 +450,8 @@ async def main():
     app.add_handler(MessageHandler(cleardest_cmd, private & filters.command("cleardest")))
     app.add_handler(MessageHandler(queue_cmd, private & filters.command("queue")))
     app.add_handler(MessageHandler(batch_cmd, private & filters.command("batch")))
-    app.add_handler(MessageHandler(link_handler, private & filters.text & ~filters.command(["start", "setdest", "mydest", "cleardest", "queue", "batch"])))
+    app.add_handler(MessageHandler(cancel_cmd, private & filters.command("cancel")))
+    app.add_handler(MessageHandler(link_handler, private & filters.text & ~filters.command(["start", "setdest", "mydest", "cleardest", "queue", "batch", "cancel"])))
     app.add_handler(MessageHandler(media_handler, private & media))
     if not USER_MODE:
         app.add_handler(MessageHandler(deny_handler, filters.private & ~owner))
