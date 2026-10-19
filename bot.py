@@ -11,6 +11,7 @@ Send the bot:
 Files go to your destination chat (/setdest), or back to you if none is set.
 """
 import asyncio
+import contextvars
 import copy
 import json
 import logging
@@ -34,11 +35,16 @@ load_dotenv()
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+# Several accounts = several parallel workers, each with its own flood limits.
+#   bot mode : BOT_TOKENS=token1,token2,token3   (first one receives your commands)
+#   user mode: USER_SESSIONS=turbo_user,acc2,acc3 (session names; first one = your Saved Messages)
+BOT_TOKENS = [t.strip() for t in (os.getenv("BOT_TOKENS") or BOT_TOKEN).split(",") if t.strip()]
+USER_SESSIONS = [t.strip() for t in os.getenv("USER_SESSIONS", "turbo_user").split(",") if t.strip()]
 USER_MODE = os.getenv("MODE", "bot").lower() == "user"   # user = log in with your own account
 OWNERS = [int(x) for x in os.getenv("OWNER_IDS", "").replace(" ", "").split(",") if x]
 WORKDIR = Path(os.getenv("WORKDIR", "/root/turbo_work"))
 JOB_WORKERS = int(os.getenv("JOB_WORKERS", "1"))
-AUTO_DELAY = int(os.getenv("AUTO_DELAY", "30"))              # seconds between auto links
+AUTO_DELAY = int(os.getenv("AUTO_DELAY", "10"))              # seconds between auto links
 AUTO_STOP_AFTER_FAILS = int(os.getenv("AUTO_STOP_AFTER_FAILS", "5"))
 AUTO_MARK = "⏩"
 MY_TAG = os.getenv("MY_TAG", "@raonemybro")        # replaces every @username in captions
@@ -57,34 +63,49 @@ jobs: asyncio.Queue = asyncio.Queue()
 current_tasks: set = set()
 auto_tasks: set = set()
 
-# ---------------------------------------------------------------- anti-flood
-_pace_lock = asyncio.Lock()
-_last_send = 0.0
-flood_until = 0.0
+# ---------------------------------------------------------------- accounts + anti-flood
+class Account:
+    """One logged-in client with its OWN pacing and FloodWait state (so one account's
+    flood wait never slows the others)."""
+
+    def __init__(self, idx: int, client: Client):
+        self.idx, self.client = idx, client
+        self.name = f"acc{idx + 1}"
+        self.pace_lock = asyncio.Lock()
+        self.last_send = 0.0
+        self.flood_until = 0.0
+
+
+accounts: list = []
+_cur = contextvars.ContextVar("account", default=None)   # set by each worker; tasks inherit it
+
+
+def acct() -> Account:
+    return _cur.get() or accounts[0]                      # handlers (no worker) use the main account
 
 
 async def pace():
-    """Global limiter: at most one send/copy/reply every SEND_INTERVAL sec, and wait out any FloodWait."""
-    global _last_send
-    async with _pace_lock:
+    """Per-account limiter: at most one send/copy/reply every SEND_INTERVAL sec, and wait out any FloodWait."""
+    a = acct()
+    async with a.pace_lock:
         now = time.monotonic()
-        wait = max(_last_send + SEND_INTERVAL - now, flood_until - now, 0)
+        wait = max(a.last_send + SEND_INTERVAL - now, a.flood_until - now, 0)
         if wait:
             await asyncio.sleep(wait)
-        _last_send = time.monotonic()
+        a.last_send = time.monotonic()
 
 
 async def flood_safe(fn, *args, paced=True, **kwargs):
-    """Call a Telegram method; on FloodWait remember it globally and retry after waiting."""
-    global flood_until
+    """Call a Telegram method; on FloodWait remember it for this account and retry after waiting."""
+    a = acct()
     for _ in range(5):
         if paced:
             await pace()
         try:
             return await fn(*args, **kwargs)
         except FloodWait as e:
-            flood_until = max(flood_until, time.monotonic() + e.value + 2)
-            log.warning("FloodWait %ss - sab kuch ruk gaya hai itni der", e.value)
+            a.flood_until = max(a.flood_until, time.monotonic() + e.value + 2)
+            log.warning("[%s] FloodWait %ss - ye account itni der ruka hai", a.name, e.value)
             await asyncio.sleep(e.value + 2)
     raise RuntimeError("FloodWait baar baar aa raha hai, thodi der baad try karo")
 
@@ -425,7 +446,7 @@ async def slow_transfer(client: Client, dest, msg, prog: Prog, job_dir: Path):
 
 
 async def run_job(client: Client, job: dict):
-    global flood_until
+    a = acct()
     status = job.get("status")
     batch = job.get("batch")
     prog = Prog()
@@ -433,7 +454,7 @@ async def run_job(client: Client, job: dict):
         batch.prog = prog
     stop = asyncio.Event()
     tick = asyncio.create_task(ticker(status, prog, stop)) if status else None
-    job_dir = WORKDIR / f"{job['user']}_{int(time.time() * 1000)}"
+    job_dir = WORKDIR / f"{job['user']}_{a.idx}_{int(time.time() * 1000)}"
     t0 = time.monotonic()
 
     async def say(text):
@@ -448,7 +469,7 @@ async def run_job(client: Client, job: dict):
         try:
             msg = await flood_safe(client.get_messages, job["src_chat"], job["src_mid"], paced=False)
         except Exception as e:
-            raise RuntimeError(f"Source message nahi mila ({e}). Kya tumhara account us channel me member hai?")
+            raise RuntimeError(f"Source message nahi mila [{a.name}] ({e}). Kya ye account us channel me member hai?")
         if msg.empty:
             raise RuntimeError("Message empty/deleted hai ya accessible nahi.")
 
@@ -480,7 +501,7 @@ async def run_job(client: Client, job: dict):
         job["result"] = "fail"
         log.exception("job failed")
         if isinstance(e, FloodWait):
-            flood_until = max(flood_until, time.monotonic() + e.value + 2)
+            a.flood_until = max(a.flood_until, time.monotonic() + e.value + 2)
             await say(f"⏳ FloodWait {e.value}s - bot itni der ruk kar aage badhega")
         else:
             await say(f"❌ Failed: {e}")
@@ -496,14 +517,16 @@ async def run_job(client: Client, job: dict):
             job["done"].set()
 
 
-async def job_worker(client: Client):
+async def job_worker(account: Account):
+    _cur.set(account)                                   # every task created below inherits this account
+    client = account.client
     while True:
         job = await jobs.get()
         task = None
         try:
-            wait = flood_until - time.monotonic()
+            wait = account.flood_until - time.monotonic()
             if wait > 0:
-                log.info("FloodWait chal raha hai, %.0fs ruk raha hoon", wait)
+                log.info("[%s] FloodWait chal raha hai, %.0fs ruk raha hoon", account.name, wait)
                 await asyncio.sleep(wait)
             task = asyncio.create_task(run_job(client, job))
             current_tasks.add(task)
@@ -649,7 +672,7 @@ async def auto_run(client, message, chat, first, n, delay):
             if job.get("result") == "ok":
                 ok += 1
                 streak = 0
-                await asyncio.sleep(delay)              # the 30s gap, only after a real transfer
+                await asyncio.sleep(delay)              # the gap, only after a real transfer
             else:
                 fail += 1
                 streak += 1
@@ -673,8 +696,8 @@ async def auto_cmd(client, message):
     if not links or not nums:
         return await message.reply_text(
             "Use: /auto <link> <kitne_aur_links> [delay_sec]\n"
-            "Example: /auto https://t.me/c/123456/100 100 30\n"
-            "Pehle ye link, phir iske aage ke 100 links, har ek ke baad 30 sec ruk kar."
+            "Example: /auto https://t.me/c/123456/100 100 10\n"
+            "Pehle ye link, phir iske aage ke 100 links, har ek ke baad 10 sec ruk kar."
         )
     if need_dest(message):
         return await message.reply_text(NEED_DEST_TEXT)
@@ -730,13 +753,17 @@ async def main():
     WORKDIR.mkdir(parents=True, exist_ok=True)
     common = dict(api_id=API_ID, api_hash=API_HASH, sleep_threshold=60, max_concurrent_transmissions=4)
     if USER_MODE:
-        # Your own account. First run asks phone + code (+ 2FA) and saves turbo_user.session
-        app = Client("turbo_user", **common)
-        private = filters.chat("me")          # commands/links only from your Saved Messages
+        # Your own accounts. First run asks phone + code (+ 2FA) for each and saves <name>.session
+        clients = [Client(name, **common) for name in USER_SESSIONS]
+        private = filters.chat("me")          # commands/links only from the first account's Saved Messages
     else:
-        app = Client("turbo_bot", bot_token=BOT_TOKEN, **common)
+        if not BOT_TOKENS:
+            raise SystemExit("BOT_TOKEN / BOT_TOKENS missing in .env")
+        clients = [Client("turbo_bot" if i == 0 else f"turbo_bot{i + 1}", bot_token=tok, **common)
+                   for i, tok in enumerate(BOT_TOKENS)]
         owner = filters.user(OWNERS) if OWNERS else filters.user([])
         private = filters.private & owner
+    app = clients[0]                          # control account: receives your commands
     turbo.install()
 
     media = filters.document | filters.video | filters.audio | filters.animation | filters.voice | filters.video_note | filters.photo
@@ -754,20 +781,27 @@ async def main():
     if not USER_MODE:
         app.add_handler(MessageHandler(deny_handler, filters.private & ~owner))
 
-    await app.start()
-    log.info("Started as %s", app.me.username or app.me.first_name)
-    if "--login" in sys.argv:
-        log.info("Login saved. Session file created.")
-        await app.stop()
-        return
-    workers = [asyncio.create_task(job_worker(app)) for _ in range(JOB_WORKERS)]
+    workers = []
     try:
+        for i, c in enumerate(clients):
+            await c.start()
+            accounts.append(Account(i, c))
+            log.info("Account %d started as %s", i + 1, c.me.username or c.me.first_name)
+        if "--login" in sys.argv:
+            log.info("Login saved. Session file(s) created.")
+            return
+        workers = [asyncio.create_task(job_worker(a)) for a in accounts for _ in range(JOB_WORKERS)]
+        log.info("%d account(s), %d parallel worker(s)", len(accounts), len(workers))
         await idle()
     finally:
         for w in workers:
             w.cancel()
         await turbo.close_all()
-        await app.stop()
+        for a in accounts:
+            try:
+                await a.client.stop()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
