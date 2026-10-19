@@ -41,7 +41,7 @@ JOB_WORKERS = int(os.getenv("JOB_WORKERS", "1"))
 AUTO_DELAY = int(os.getenv("AUTO_DELAY", "30"))              # seconds between auto links
 AUTO_STOP_AFTER_FAILS = int(os.getenv("AUTO_STOP_AFTER_FAILS", "5"))
 AUTO_MARK = "⏩"
-MY_TAG = os.getenv("MY_TAG", "@raonemybro")        # goes after "Extracted by"
+MY_TAG = os.getenv("MY_TAG", "@raonemybro")        # replaces every @username in captions
 SEND_INTERVAL = float(os.getenv("SEND_INTERVAL", "2"))   # min seconds between sends/copies (anti-flood)
 SETTINGS_FILE = Path(os.getenv("SETTINGS_FILE", "settings.json"))
 
@@ -229,9 +229,11 @@ async def ticker(status, prog: Prog, stop: asyncio.Event):
 
 
 # ---------------------------------------------------------------- caption rewrite
-EB_PAT = re.compile(r"extracted\s*by", re.I)
-EB_SEP = re.compile(r"[ \t:\-\u2013\u2014|=>~.]*")
 LINK_KINDS = {"text_link", "url", "mention", "text_mention"}
+URL_RE = re.compile(
+    r"(?:https?://|www\.|t\.me/|telegram\.me/)[^\s]*[^\s.,;:!?)\]}\"']", re.I
+)
+USER_RE = re.compile(r"(?<![\w.@/])@[A-Za-z][A-Za-z0-9_]{3,31}")
 
 
 def _u16_positions(text: str):
@@ -248,58 +250,82 @@ def _kind(entity) -> str:
 
 def rewrite_caption(text, entities, tag=None):
     """
-    Wherever the caption says "Extracted by", replace everything after it on that line
-    (name, @username, hyperlink...) with our tag. Links/mentions inside that part are removed.
+    1) Every hyperlink in the caption is removed (hidden links lose the link but keep their
+       text, visible URLs are deleted).
+    2) Every @username / user-mention is replaced with our tag.
+    Anything else (names, fancy fonts, emojis...) is left exactly as it is.
     Returns (text, entities, changed). Entities use Telegram's UTF-16 offsets.
     """
     tag = tag or MY_TAG
     if not text:
         return text, entities, False
 
-    regions, last_end = [], -1
-    for m in EB_PAT.finditer(text):
-        if m.start() < last_end:
-            continue
-        start = EB_SEP.match(text, m.end()).end()
-        nl = text.find("\n", start)
-        end = len(text) if nl == -1 else nl
-        repl = (" " + tag) if text[start - 1].isalnum() else tag
-        if text[start:end].strip() == tag and not any(
-            _kind(e) in LINK_KINDS for e in (entities or [])
-        ):
-            last_end = end
-            continue                                  # already ours
-        regions.append((start, end, repl))
-        last_end = end
-    if not regions:
-        return text, entities, False
-
+    # Pyrogram's Str slices by UTF-16 units, but re/find use code points. With emojis or
+    # fancy fonts these disagree and cut a surrogate pair in half -> "utf-16-le codec can't
+    # decode ... unexpected end of data". A plain str has no such problem.
+    text = str(text)
     ents = list(entities or [])
+    pos = _u16_positions(text)
+    inv = {u: i for i, u in enumerate(pos)}
+
+    changed = any(_kind(e) == "text_link" for e in ents)
+    ents = [e for e in ents if _kind(e) != "text_link"]     # hidden hyperlink: drop the link, keep the text
+
+    cand = []                                               # (start, end, replacement) in code points
+    for e in ents:
+        k = _kind(e)
+        if k in ("url", "mention", "text_mention"):
+            s, en = inv.get(e.offset), inv.get(e.offset + e.length)
+            if s is not None and en is not None:
+                cand.append((s, en, "" if k == "url" else tag))
+    for m in URL_RE.finditer(text):
+        cand.append((m.start(), m.end(), ""))
+    for m in USER_RE.finditer(text):
+        cand.append((m.start(), m.end(), tag))
+
+    regions, last_end = [], -1
+    for s, en, repl in sorted(cand, key=lambda r: (r[0], -(r[1] - r[0]))):
+        if s < last_end:
+            continue                                        # overlaps a region already taken
+        last_end = en
+        if repl and text[s:en].lower() == repl.lower():
+            continue                                        # already our tag
+        regions.append((s, en, repl))
+
+    if not regions:
+        return text, (ents if changed else entities), changed
+
     for s_py, e_py, repl in sorted(regions, reverse=True):
-        pos = _u16_positions(text)
-        rs, re_ = pos[s_py], pos[e_py]
-        delta = len(repl.encode("utf-16-le")) // 2 - (re_ - rs)
+        rs, re_ = pos[s_py], pos[e_py]                      # prefix before the region is untouched, so pos stays valid
+        rlen = len(repl.encode("utf-16-le")) // 2
+        delta = rlen - (re_ - rs)
         kept = []
         for e in ents:
             o, end = e.offset, e.offset + e.length
             if end <= rs:
-                kept.append(e)                                    # before the region
+                kept.append(e)                              # before the region
             elif o >= re_:
                 n = copy.copy(e)
-                n.offset = o + delta                              # after the region
+                n.offset = o + delta                        # after the region
                 kept.append(n)
             elif _kind(e) in LINK_KINDS:
-                continue                                          # hyperlink / username: remove
+                continue                                    # link / mention touching it: remove
             elif o <= rs and end >= re_:
                 n = copy.copy(e)
-                n.length = e.length + delta                       # formatting around it: resize
+                n.length = e.length + delta                 # formatting around it: resize
                 kept.append(n)
             elif o < rs:
                 n = copy.copy(e)
-                n.length = rs - o                                 # starts before, ends inside
+                n.length = rs - o                           # starts before, ends inside
+                kept.append(n)
+            elif end > re_:
+                n = copy.copy(e)
+                n.offset = rs + rlen                        # starts inside, ends after
+                n.length = end - re_
                 kept.append(n)
         ents = kept
         text = text[:s_py] + repl + text[e_py:]
+    ents = [e for e in ents if e.length > 0]
     return text, ents, True
 
 
