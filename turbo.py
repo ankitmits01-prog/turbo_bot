@@ -12,7 +12,9 @@ import asyncio
 import io
 import logging
 import math
+import inspect
 import os
+import random
 import time
 from pathlib import PurePath
 
@@ -25,7 +27,8 @@ from pyrogram.session.auth import Auth
 log = logging.getLogger("turbo")
 
 SESSIONS = int(os.getenv("TURBO_SESSIONS", "4"))      # connections per DC
-INFLIGHT = int(os.getenv("TURBO_INFLIGHT", "3"))      # requests in flight per connection
+INFLIGHT = int(os.getenv("TURBO_INFLIGHT", "3"))
+ADAPTIVE = os.getenv("TURBO_ADAPTIVE", "0") == "1"    # 1 = auto-slow-down on FloodWait (off = original fast behaviour)      # requests in flight per connection
 DL_CHUNK = 1024 * 1024                                # max allowed for upload.GetFile
 UL_CHUNK = 512 * 1024                                 # max allowed for SaveBigFilePart
 BIG_FILE = 10 * 1024 * 1024                           # below this, use stock Pyrogram
@@ -99,23 +102,98 @@ async def close_all():
         await drop_pool(dc)
 
 
-async def _invoke_retry(session, query):
+class Limiter:
+    """
+    Adaptive concurrency limiter. Telegram answers "FloodWait" when too many chunk requests
+    arrive at once. On a flood we halve the number of simultaneous requests and pause ALL
+    workers together (no thundering herd); after a clean streak we slowly speed up again.
+    """
+
+    def __init__(self, name: str, maxn: int):
+        self.name, self.max, self.limit = name, maxn, maxn
+        self.floor = max(4, maxn // 4)
+        self.active = 0
+        self.ok_streak = 0
+        self.blocked_until = 0.0
+
+    async def acquire(self):
+        while True:
+            wait = self.blocked_until - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+                continue
+            if self.active < self.limit:
+                self.active += 1
+                return
+            await asyncio.sleep(0.05)
+
+    def release(self):
+        self.active -= 1
+
+    def on_ok(self):
+        self.ok_streak += 1
+        if self.ok_streak >= 8 and self.limit < self.max:
+            self.limit += 1
+            self.ok_streak = 0
+
+    def on_flood(self, seconds: float):
+        if time.monotonic() >= self.blocked_until:        # halve ONCE per flood burst, not once per request
+            self.limit = max(self.floor, self.limit // 2)
+        self.ok_streak = 0
+        self.blocked_until = max(self.blocked_until, time.monotonic() + seconds + 1 + random.random())
+        log.warning("FloodWait %ss on %s -> parallel requests now %s", seconds, self.name, self.limit)
+
+
+DL_LIM = Limiter("download", SESSIONS * INFLIGHT)
+UL_LIM = Limiter("upload", SESSIONS * INFLIGHT)
+
+try:
+    _CAN_NO_SLEEP = "sleep_threshold" in inspect.signature(Session.invoke).parameters
+except Exception:
+    _CAN_NO_SLEEP = False
+
+
+async def _call(session, query):
+    # sleep_threshold=0 makes pyrogram RAISE FloodWait instead of silently sleeping per request,
+    # so our Limiter can slow everything down at once.
+    if ADAPTIVE and _CAN_NO_SLEEP:
+        return await session.invoke(query, sleep_threshold=0)
+    return await session.invoke(query)
+
+
+async def _invoke_retry(session, query, limiter: "Limiter" = None):
+    if not ADAPTIVE:
+        limiter = None
+    errors = floods = 0
     last = None
-    for attempt in range(RETRIES):
+    while True:
+        if limiter:
+            await limiter.acquire()
         try:
-            return await session.invoke(query)
+            r = await _call(session, query)
+            if limiter:
+                limiter.on_ok()
+            return r
         except FloodWait as e:
+            floods += 1
             wait = getattr(e, "value", 1)
-            if wait > 60:          # long ban: fail fast, let the bot pause everything
+            if wait > 120 or floods > 40:      # long ban: fail fast, bot pauses everything
                 raise
-            await asyncio.sleep(wait + 1)
-            last = e
+            if limiter:
+                limiter.on_flood(wait)
+            else:
+                await asyncio.sleep(wait + 1)
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # timeouts, connection resets, etc.
+        except Exception as e:                 # timeouts, connection resets, etc.
+            errors += 1
             last = e
-            await asyncio.sleep(min(1 + attempt, 5))
-    raise last
+            if errors >= RETRIES:
+                raise last
+            await asyncio.sleep(min(errors, 5))
+        finally:
+            if limiter:
+                limiter.release()
 
 
 async def _run_workers(count: int, worker):
@@ -174,6 +252,7 @@ async def turbo_download(client: Client, file_id: str, file_size: int, dest_path
             r = await _invoke_retry(
                 session,
                 raw.functions.upload.GetFile(location=location, offset=offset, limit=DL_CHUNK),
+                DL_LIM,
             )
             if not isinstance(r, raw.types.upload.File):
                 raise RuntimeError("CDN redirect not supported, use normal download")
@@ -263,6 +342,7 @@ async def _turbo_save_file(
                     file_total_parts=total_parts,
                     bytes=data,
                 ),
+                UL_LIM,
             )
             state["done"] += len(data)
             await report()
@@ -341,7 +421,7 @@ async def _relay(self: Client, rf: RelayFile, progress, progress_args):
             state["next"] += 1
             offset = c * DL_CHUNK
             r = await _invoke_retry(
-                dls, raw.functions.upload.GetFile(location=location, offset=offset, limit=DL_CHUNK)
+                dls, raw.functions.upload.GetFile(location=location, offset=offset, limit=DL_CHUNK), DL_LIM
             )
             if not isinstance(r, raw.types.upload.File):
                 raise RuntimeError("CDN redirect not supported")
@@ -357,6 +437,7 @@ async def _relay(self: Client, rf: RelayFile, progress, progress_args):
                         file_total_parts=total_parts,
                         bytes=data[k:k + UL_CHUNK],
                     ),
+                    UL_LIM,
                 )
                 for k in range(0, len(data), UL_CHUNK)
             ]
