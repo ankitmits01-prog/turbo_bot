@@ -11,6 +11,7 @@ Send the bot:
 Files go to your destination chat (/setdest), or back to you if none is set.
 """
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
+from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 from pyrogram.handlers import MessageHandler
 
@@ -39,6 +41,7 @@ JOB_WORKERS = int(os.getenv("JOB_WORKERS", "1"))
 AUTO_DELAY = int(os.getenv("AUTO_DELAY", "30"))              # seconds between auto links
 AUTO_STOP_AFTER_FAILS = int(os.getenv("AUTO_STOP_AFTER_FAILS", "5"))
 AUTO_MARK = "⏩"
+MY_TAG = os.getenv("MY_TAG", "@raonemybro")        # goes after "Extracted by"
 SEND_INTERVAL = float(os.getenv("SEND_INTERVAL", "2"))   # min seconds between sends/copies (anti-flood)
 SETTINGS_FILE = Path(os.getenv("SETTINGS_FILE", "settings.json"))
 
@@ -225,13 +228,92 @@ async def ticker(status, prog: Prog, stop: asyncio.Event):
             pass
 
 
+# ---------------------------------------------------------------- caption rewrite
+EB_PAT = re.compile(r"extracted\s*by", re.I)
+EB_SEP = re.compile(r"[ \t:\-\u2013\u2014|=>~.]*")
+LINK_KINDS = {"text_link", "url", "mention", "text_mention"}
+
+
+def _u16_positions(text: str):
+    pos = [0]
+    for ch in text:
+        pos.append(pos[-1] + (2 if ord(ch) > 0xFFFF else 1))
+    return pos
+
+
+def _kind(entity) -> str:
+    t = entity.type
+    return str(getattr(t, "name", t)).lower()
+
+
+def rewrite_caption(text, entities, tag=None):
+    """
+    Wherever the caption says "Extracted by", replace everything after it on that line
+    (name, @username, hyperlink...) with our tag. Links/mentions inside that part are removed.
+    Returns (text, entities, changed). Entities use Telegram's UTF-16 offsets.
+    """
+    tag = tag or MY_TAG
+    if not text:
+        return text, entities, False
+
+    regions, last_end = [], -1
+    for m in EB_PAT.finditer(text):
+        if m.start() < last_end:
+            continue
+        start = EB_SEP.match(text, m.end()).end()
+        nl = text.find("\n", start)
+        end = len(text) if nl == -1 else nl
+        repl = (" " + tag) if text[start - 1].isalnum() else tag
+        if text[start:end].strip() == tag and not any(
+            _kind(e) in LINK_KINDS for e in (entities or [])
+        ):
+            last_end = end
+            continue                                  # already ours
+        regions.append((start, end, repl))
+        last_end = end
+    if not regions:
+        return text, entities, False
+
+    ents = list(entities or [])
+    for s_py, e_py, repl in sorted(regions, reverse=True):
+        pos = _u16_positions(text)
+        rs, re_ = pos[s_py], pos[e_py]
+        delta = len(repl.encode("utf-16-le")) // 2 - (re_ - rs)
+        kept = []
+        for e in ents:
+            o, end = e.offset, e.offset + e.length
+            if end <= rs:
+                kept.append(e)                                    # before the region
+            elif o >= re_:
+                n = copy.copy(e)
+                n.offset = o + delta                              # after the region
+                kept.append(n)
+            elif _kind(e) in LINK_KINDS:
+                continue                                          # hyperlink / username: remove
+            elif o <= rs and end >= re_:
+                n = copy.copy(e)
+                n.length = e.length + delta                       # formatting around it: resize
+                kept.append(n)
+            elif o < rs:
+                n = copy.copy(e)
+                n.length = rs - o                                 # starts before, ends inside
+                kept.append(n)
+        ents = kept
+        text = text[:s_py] + repl + text[e_py:]
+    return text, ents, True
+
+
 # ---------------------------------------------------------------- core job
 async def fast_copy(client: Client, dest, src_chat, msg) -> bool:
     """Server-side copy. Returns True on success, False if content is restricted."""
     if getattr(msg, "has_protected_content", False) or getattr(msg.chat, "has_protected_content", False):
         return False
     try:
-        await flood_safe(client.copy_message, dest, src_chat, msg.id)
+        kw = {}
+        new_cap, new_ents, changed = rewrite_caption(msg.caption, msg.caption_entities)
+        if changed:
+            kw = dict(caption=new_cap, caption_entities=new_ents or None, parse_mode=ParseMode.DISABLED)
+        await flood_safe(client.copy_message, dest, src_chat, msg.id, **kw)
         return True
     except Exception as e:
         text = str(e).upper()
@@ -242,12 +324,11 @@ async def fast_copy(client: Client, dest, src_chat, msg) -> bool:
 
 async def slow_transfer(client: Client, dest, msg, prog: Prog, job_dir: Path):
     media = msg.video or msg.document or msg.audio or msg.animation or msg.voice or msg.video_note
-    caption = msg.caption or ""
-    ents = msg.caption_entities
+    caption, ents, _ = rewrite_caption(msg.caption or "", msg.caption_entities)
 
     if msg.photo:
         path = await client.download_media(msg, file_name=str(job_dir) + "/")
-        await client.send_photo(dest, path, caption=caption, caption_entities=ents)
+        await client.send_photo(dest, path, caption=caption, caption_entities=ents or None, parse_mode=ParseMode.DISABLED)
         return
     if not media:
         if msg.text:
@@ -271,7 +352,7 @@ async def slow_transfer(client: Client, dest, msg, prog: Prog, job_dir: Path):
             thumb = None
 
     common = dict(chat_id=dest, progress=prog.cb)
-    cap = dict(caption=caption, caption_entities=ents)
+    cap = dict(caption=caption, caption_entities=ents or None, parse_mode=ParseMode.DISABLED)
 
     async def send(src):
         if msg.video:
