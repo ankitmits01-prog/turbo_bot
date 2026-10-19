@@ -35,7 +35,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 USER_MODE = os.getenv("MODE", "bot").lower() == "user"   # user = log in with your own account
 OWNERS = [int(x) for x in os.getenv("OWNER_IDS", "").replace(" ", "").split(",") if x]
 WORKDIR = Path(os.getenv("WORKDIR", "/root/turbo_work"))
-JOB_WORKERS = int(os.getenv("JOB_WORKERS", "2"))
+JOB_WORKERS = int(os.getenv("JOB_WORKERS", "1"))
+SEND_INTERVAL = float(os.getenv("SEND_INTERVAL", "2"))   # min seconds between sends/copies (anti-flood)
 SETTINGS_FILE = Path(os.getenv("SETTINGS_FILE", "settings.json"))
 
 logging.basicConfig(
@@ -47,6 +48,76 @@ log = logging.getLogger("bot")
 LINK_RE = re.compile(r"(?:https?://)?t\.me/(c/)?([^/\s]+)/(\d+)(?:/(\d+))?")
 
 jobs: asyncio.Queue = asyncio.Queue()
+current_tasks: set = set()
+
+# ---------------------------------------------------------------- anti-flood
+_pace_lock = asyncio.Lock()
+_last_send = 0.0
+flood_until = 0.0
+
+
+async def pace():
+    """Global limiter: at most one send/copy/reply every SEND_INTERVAL sec, and wait out any FloodWait."""
+    global _last_send
+    async with _pace_lock:
+        now = time.monotonic()
+        wait = max(_last_send + SEND_INTERVAL - now, flood_until - now, 0)
+        if wait:
+            await asyncio.sleep(wait)
+        _last_send = time.monotonic()
+
+
+async def flood_safe(fn, *args, paced=True, **kwargs):
+    """Call a Telegram method; on FloodWait remember it globally and retry after waiting."""
+    global flood_until
+    for _ in range(5):
+        if paced:
+            await pace()
+        try:
+            return await fn(*args, **kwargs)
+        except FloodWait as e:
+            flood_until = max(flood_until, time.monotonic() + e.value + 2)
+            log.warning("FloodWait %ss - sab kuch ruk gaya hai itni der", e.value)
+            await asyncio.sleep(e.value + 2)
+    raise RuntimeError("FloodWait baar baar aa raha hai, thodi der baad try karo")
+
+
+class Batch:
+    """One shared status message for many jobs (no per-file reply spam)."""
+
+    def __init__(self, total, status):
+        self.total, self.status = total, status
+        self.ok = self.fail = self.cancelled = 0
+        self.prog = None
+        self.last_error = ""
+
+
+async def batch_reporter(batch: "Batch"):
+    last = ""
+    while batch.ok + batch.fail + batch.cancelled < batch.total:
+        await asyncio.sleep(6)
+        text = f"📦 Batch: {batch.ok} done, {batch.fail} failed / {batch.total}\n(rokne ke liye /cancel bhejo)"
+        if batch.prog and batch.prog.total:
+            text += "\n\n" + batch.prog.render()
+        if batch.last_error:
+            text += f"\n\n⚠️ Last error: {batch.last_error[:150]}"
+        if text == last:
+            continue
+        last = text
+        try:
+            await batch.status.edit_text(text)
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+        except Exception:
+            pass
+    try:
+        head = "🛑 Batch cancelled" if batch.cancelled else "✅ Batch complete"
+        await batch.status.edit_text(
+            f"{head}: {batch.ok} done, {batch.fail} failed, {batch.cancelled} cancelled / {batch.total}"
+        )
+    except Exception:
+        pass
+
 
 
 # ---------------------------------------------------------------- helpers
@@ -133,7 +204,7 @@ async def ticker(status, prog: Prog, stop: asyncio.Event):
     last = ""
     while not stop.is_set():
         try:
-            await asyncio.wait_for(stop.wait(), 3)
+            await asyncio.wait_for(stop.wait(), 5)
         except asyncio.TimeoutError:
             pass
         if stop.is_set() or not prog.total:
@@ -156,11 +227,7 @@ async def fast_copy(client: Client, dest, src_chat, msg) -> bool:
     if getattr(msg, "has_protected_content", False) or getattr(msg.chat, "has_protected_content", False):
         return False
     try:
-        await client.copy_message(dest, src_chat, msg.id)
-        return True
-    except FloodWait as e:
-        await asyncio.sleep(e.value + 1)
-        await client.copy_message(dest, src_chat, msg.id)
+        await flood_safe(client.copy_message, dest, src_chat, msg.id)
         return True
     except Exception as e:
         text = str(e).upper()
@@ -247,52 +314,90 @@ async def slow_transfer(client: Client, dest, msg, prog: Prog, job_dir: Path):
 
 
 async def run_job(client: Client, job: dict):
-    status = job["status"]
+    global flood_until
+    status = job.get("status")
+    batch = job.get("batch")
     prog = Prog()
+    if batch:
+        batch.prog = prog
     stop = asyncio.Event()
-    tick = asyncio.create_task(ticker(status, prog, stop))
+    tick = asyncio.create_task(ticker(status, prog, stop)) if status else None
     job_dir = WORKDIR / f"{job['user']}_{int(time.time() * 1000)}"
     t0 = time.monotonic()
+
+    async def say(text):
+        if status is None:
+            return
+        try:
+            await status.edit_text(text)
+        except Exception:
+            pass
+
     try:
         try:
-            msg = await client.get_messages(job["src_chat"], job["src_mid"])
+            msg = await flood_safe(client.get_messages, job["src_chat"], job["src_mid"], paced=False)
         except Exception as e:
-            raise RuntimeError(
-                f"Source message nahi mila ({e}). Bot ko us channel/group me add karo."
-            )
+            raise RuntimeError(f"Source message nahi mila ({e}). Kya tumhara account us channel me member hai?")
         if msg.empty:
-            raise RuntimeError("Message empty/deleted hai ya bot ke liye accessible nahi.")
+            raise RuntimeError("Message empty/deleted hai ya accessible nahi.")
 
         dest = job["dest"]
         if await fast_copy(client, dest, job["src_chat"], msg):
-            await status.edit_text(f"✅ Copied instantly in {time.monotonic() - t0:.1f}s")
+            await say(f"✅ Copied instantly in {time.monotonic() - t0:.1f}s")
+            if batch:
+                batch.ok += 1
             return
 
-        await status.edit_text("🔒 Content restricted, turbo download/upload shuru kar raha hoon...")
+        await say("🔒 Content restricted, turbo download/upload shuru kar raha hoon...")
         job_dir.mkdir(parents=True, exist_ok=True)
         await slow_transfer(client, dest, msg, prog, job_dir)
         took = time.monotonic() - t0
         size = prog.total or 0
         avg = size / took if took else 0
-        await status.edit_text(f"✅ Done: {human(size)} in {took:.0f}s (avg {human(avg)}/s)")
+        await say(f"✅ Done: {human(size)} in {took:.0f}s (avg {human(avg)}/s)")
+        if batch:
+            batch.ok += 1
+    except asyncio.CancelledError:
+        await say("🛑 Cancelled")
+        if batch:
+            batch.cancelled += 1
+        raise
     except Exception as e:
         log.exception("job failed")
-        try:
-            await status.edit_text(f"❌ Failed: {e}")
-        except Exception:
-            pass
+        if isinstance(e, FloodWait):
+            flood_until = max(flood_until, time.monotonic() + e.value + 2)
+            await say(f"⏳ FloodWait {e.value}s - bot itni der ruk kar aage badhega")
+        else:
+            await say(f"❌ Failed: {e}")
+        if batch:
+            batch.fail += 1
+            batch.last_error = str(e)
     finally:
         stop.set()
-        await tick
+        if tick:
+            await tick
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
 async def job_worker(client: Client):
     while True:
         job = await jobs.get()
+        task = None
         try:
-            await run_job(client, job)
+            wait = flood_until - time.monotonic()
+            if wait > 0:
+                log.info("FloodWait chal raha hai, %.0fs ruk raha hoon", wait)
+                await asyncio.sleep(wait)
+            task = asyncio.create_task(run_job(client, job))
+            current_tasks.add(task)
+            await asyncio.wait({task})          # does not raise if /cancel kills the job
+        except asyncio.CancelledError:
+            if task:
+                task.cancel()
+            raise
         finally:
+            if task:
+                current_tasks.discard(task)
             jobs.task_done()
 
 
@@ -307,7 +412,7 @@ NEED_DEST_TEXT = "⚠️ Pehle destination set karo: /setdest -100xxxxxxxxxx  (y
 async def enqueue(message, src_chat, src_mid):
     if need_dest(message):
         return await message.reply_text(NEED_DEST_TEXT)
-    status = await message.reply_text("⏳ Queued...", quote=True)
+    status = await flood_safe(message.reply_text, "⏳ Queued...", quote=True)
     await jobs.put(
         dict(
             user=message.from_user.id,
@@ -319,6 +424,19 @@ async def enqueue(message, src_chat, src_mid):
     )
 
 
+async def enqueue_batch(message, items):
+    """items = [(chat, mid), ...]  ->  ONE status message for the whole batch."""
+    if need_dest(message):
+        return await message.reply_text(NEED_DEST_TEXT)
+    status = await flood_safe(message.reply_text, f"📦 Batch: 0 done, 0 failed / {len(items)}\n(rokne ke liye /cancel bhejo)", quote=True)
+    batch = Batch(len(items), status)
+    dest = get_dest(message.from_user.id, message.chat.id)
+    for chat, mid in items:
+        await jobs.put(dict(user=message.from_user.id, status=None, batch=batch,
+                            src_chat=chat, src_mid=mid, dest=dest))
+    asyncio.create_task(batch_reporter(batch))
+
+
 # ---------------------------------------------------------------- handlers
 async def start_cmd(client, message):
     await message.reply_text(
@@ -327,7 +445,7 @@ async def start_cmd(client, message):
         "• /batch <first_link> <last_link> : poori range\n"
         "• Koi file forward karo : destination par copy ho jayegi\n"
         "• /setdest <chat_id ya @username> : destination (bot wahan admin ho)\n"
-        "• /mydest, /cleardest, /queue"
+        "• /mydest, /cleardest, /queue\n• /cancel : sab kuch rok do (chalti + queue wali jobs)"
     )
 
 
@@ -357,35 +475,52 @@ async def cleardest_cmd(client, message):
     await message.reply_text("✅ Destination clear.")
 
 
+async def cancel_cmd(client, message):
+    """Stop the running job(s) and throw away everything waiting in the queue."""
+    dropped = 0
+    while True:
+        try:
+            job = jobs.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        jobs.task_done()
+        dropped += 1
+        if job.get("batch"):
+            job["batch"].cancelled += 1
+    running = [t for t in current_tasks if not t.done()]
+    for t in running:
+        t.cancel()
+    await message.reply_text(
+        f"🛑 Cancel ho gaya: {len(running)} chalti job band, {dropped} queue wali hata di.\n"
+        "Naya kaam ab seedha bhej sakte ho."
+    )
+
+
 async def queue_cmd(client, message):
     await message.reply_text(f"Queue me {jobs.qsize()} job(s) hain.")
 
 
 async def batch_cmd(client, message):
-    if need_dest(message):
-        return await message.reply_text(NEED_DEST_TEXT)
     links = all_links(message.text)
     if len(links) < 2 or links[0][0] != links[1][0]:
         return await message.reply_text("Use: /batch <first_link> <last_link> (same channel ke)")
     chat, a = links[0]
-    b = links[1][1]
-    lo, hi = min(a, b), max(a, b)
+    last = links[1][1]
+    lo, hi = min(a, last), max(a, last)
     if hi - lo > 300:
         return await message.reply_text("Ek baar me max 300 messages.")
-    status = await message.reply_text(f"⏳ {hi - lo + 1} message queue kar raha hoon...", quote=True)
-    dest = get_dest(message.from_user.id, message.chat.id)
-    for mid in range(lo, hi + 1):
-        s = await message.reply_text(f"⏳ Queued #{mid}", quote=False)
-        await jobs.put(dict(user=message.from_user.id, status=s, src_chat=chat, src_mid=mid, dest=dest))
-    await status.edit_text(f"✅ {hi - lo + 1} job queue me daal diye.")
+    await enqueue_batch(message, [(chat, mid) for mid in range(lo, hi + 1)])
 
 
 async def link_handler(client, message):
     links = all_links(message.text or "")
     if not links:
         return
-    for chat, mid in links[:50]:
-        await enqueue(message, chat, mid)
+    links = links[:50]
+    if len(links) == 1:
+        await enqueue(message, *links[0])
+    else:
+        await enqueue_batch(message, links)
 
 
 async def media_handler(client, message):
@@ -417,8 +552,9 @@ async def main():
     app.add_handler(MessageHandler(mydest_cmd, private & filters.command("mydest")))
     app.add_handler(MessageHandler(cleardest_cmd, private & filters.command("cleardest")))
     app.add_handler(MessageHandler(queue_cmd, private & filters.command("queue")))
+    app.add_handler(MessageHandler(cancel_cmd, private & filters.command("cancel")))
     app.add_handler(MessageHandler(batch_cmd, private & filters.command("batch")))
-    app.add_handler(MessageHandler(link_handler, private & filters.text & ~filters.command(["start", "setdest", "mydest", "cleardest", "queue", "batch"])))
+    app.add_handler(MessageHandler(link_handler, private & filters.text & ~filters.command(["start", "setdest", "mydest", "cleardest", "queue", "batch", "cancel"])))
     app.add_handler(MessageHandler(media_handler, private & media))
     if not USER_MODE:
         app.add_handler(MessageHandler(deny_handler, filters.private & ~owner))
