@@ -36,6 +36,9 @@ USER_MODE = os.getenv("MODE", "bot").lower() == "user"   # user = log in with yo
 OWNERS = [int(x) for x in os.getenv("OWNER_IDS", "").replace(" ", "").split(",") if x]
 WORKDIR = Path(os.getenv("WORKDIR", "/root/turbo_work"))
 JOB_WORKERS = int(os.getenv("JOB_WORKERS", "1"))
+AUTO_DELAY = int(os.getenv("AUTO_DELAY", "30"))              # seconds between auto links
+AUTO_STOP_AFTER_FAILS = int(os.getenv("AUTO_STOP_AFTER_FAILS", "5"))
+AUTO_MARK = "⏩"
 SEND_INTERVAL = float(os.getenv("SEND_INTERVAL", "2"))   # min seconds between sends/copies (anti-flood)
 SETTINGS_FILE = Path(os.getenv("SETTINGS_FILE", "settings.json"))
 
@@ -49,6 +52,7 @@ LINK_RE = re.compile(r"(?:https?://)?t\.me/(c/)?([^/\s]+)/(\d+)(?:/(\d+))?")
 
 jobs: asyncio.Queue = asyncio.Queue()
 current_tasks: set = set()
+auto_tasks: set = set()
 
 # ---------------------------------------------------------------- anti-flood
 _pace_lock = asyncio.Lock()
@@ -344,6 +348,7 @@ async def run_job(client: Client, job: dict):
         dest = job["dest"]
         if await fast_copy(client, dest, job["src_chat"], msg):
             await say(f"✅ Copied instantly in {time.monotonic() - t0:.1f}s")
+            job["result"] = "ok"
             if batch:
                 batch.ok += 1
             return
@@ -355,14 +360,17 @@ async def run_job(client: Client, job: dict):
         size = prog.total or 0
         avg = size / took if took else 0
         await say(f"✅ Done: {human(size)} in {took:.0f}s (avg {human(avg)}/s)")
+        job["result"] = "ok"
         if batch:
             batch.ok += 1
     except asyncio.CancelledError:
+        job["result"] = "cancel"
         await say("🛑 Cancelled")
         if batch:
             batch.cancelled += 1
         raise
     except Exception as e:
+        job["result"] = "fail"
         log.exception("job failed")
         if isinstance(e, FloodWait):
             flood_until = max(flood_until, time.monotonic() + e.value + 2)
@@ -377,6 +385,8 @@ async def run_job(client: Client, job: dict):
         if tick:
             await tick
         shutil.rmtree(job_dir, ignore_errors=True)
+        if job.get("done"):
+            job["done"].set()
 
 
 async def job_worker(client: Client):
@@ -445,7 +455,7 @@ async def start_cmd(client, message):
         "• /batch <first_link> <last_link> : poori range\n"
         "• Koi file forward karo : destination par copy ho jayegi\n"
         "• /setdest <chat_id ya @username> : destination (bot wahan admin ho)\n"
-        "• /mydest, /cleardest, /queue\n• /cancel : sab kuch rok do (chalti + queue wali jobs)"
+        "• /auto <link> <N> [delay] : link + uske aage ke N links, ek ek karke\n• /mydest, /cleardest, /queue\n• /cancel : sab kuch rok do (chalti + queue wali jobs)"
     )
 
 
@@ -487,17 +497,92 @@ async def cancel_cmd(client, message):
         dropped += 1
         if job.get("batch"):
             job["batch"].cancelled += 1
+        job["result"] = "cancel"
+        if job.get("done"):
+            job["done"].set()
+    autos = [t for t in auto_tasks if not t.done()]
+    for t in autos:
+        t.cancel()
     running = [t for t in current_tasks if not t.done()]
     for t in running:
         t.cancel()
     await message.reply_text(
-        f"🛑 Cancel ho gaya: {len(running)} chalti job band, {dropped} queue wali hata di.\n"
+        f"🛑 Cancel ho gaya: {len(running)} chalti job band, {dropped} queue wali hata di"
+        f"{', auto mode band' if autos else ''}.\n"
         "Naya kaam ab seedha bhej sakte ho."
     )
 
 
 async def queue_cmd(client, message):
     await message.reply_text(f"Queue me {jobs.qsize()} job(s) hain.")
+
+
+def make_link(chat, mid) -> str:
+    if isinstance(chat, int):                       # private/numeric channel  -100xxxxxxxxxx
+        return f"https://t.me/c/{str(chat)[4:]}/{mid}"
+    return f"https://t.me/{chat}/{mid}"
+
+
+async def auto_run(client, message, chat, first, n, delay):
+    user_id = message.from_user.id
+    dest = get_dest(user_id, message.chat.id)
+    total = n + 1
+    ok = fail = streak = 0
+    reason = "complete"
+    try:
+        for i in range(total):
+            mid = first + i
+            posted = await flood_safe(client.send_message, message.chat.id,
+                                      f"{AUTO_MARK} #{i + 1}/{total}  {make_link(chat, mid)}")
+            status = await flood_safe(posted.reply_text, "⏳ Queued...", quote=True)
+            job = dict(user=user_id, status=status, src_chat=chat, src_mid=mid, dest=dest,
+                       done=asyncio.Event())
+            await jobs.put(job)
+            await job["done"].wait()
+            if job.get("result") == "ok":
+                ok += 1
+                streak = 0
+                await asyncio.sleep(delay)              # the 30s gap, only after a real transfer
+            else:
+                fail += 1
+                streak += 1
+                if streak >= AUTO_STOP_AFTER_FAILS:
+                    reason = f"{streak} message lagatar fail hue (shayad channel ke end tak pahunch gaye)"
+                    break
+                await asyncio.sleep(3)
+    except asyncio.CancelledError:
+        reason = "cancelled"
+        raise
+    finally:
+        try:
+            await message.reply_text(f"🤖 Auto {reason}: {ok} done, {fail} failed (total {total} links)", quote=False)
+        except Exception:
+            pass
+
+
+async def auto_cmd(client, message):
+    links = all_links(message.text or "")
+    nums = [int(a) for a in message.command[1:] if a.isdigit()]
+    if not links or not nums:
+        return await message.reply_text(
+            "Use: /auto <link> <kitne_aur_links> [delay_sec]\n"
+            "Example: /auto https://t.me/c/123456/100 100 30\n"
+            "Pehle ye link, phir iske aage ke 100 links, har ek ke baad 30 sec ruk kar."
+        )
+    if need_dest(message):
+        return await message.reply_text(NEED_DEST_TEXT)
+    if any(not t.done() for t in auto_tasks):
+        return await message.reply_text("Ek auto already chal raha hai. Pehle /cancel bhejo.")
+    n = min(nums[0], 500)
+    delay = max(nums[1], 5) if len(nums) > 1 else AUTO_DELAY
+    chat, first = links[0]
+    task = asyncio.create_task(auto_run(client, message, chat, first, n, delay))
+    auto_tasks.add(task)
+    task.add_done_callback(auto_tasks.discard)
+    await message.reply_text(
+        f"🤖 Auto shuru: #{first} se aage {n} links (total {n + 1}), har ek ke baad {delay}s ka gap.\n"
+        "Rokne ke liye /cancel bhejo."
+    )
 
 
 async def batch_cmd(client, message):
@@ -513,6 +598,8 @@ async def batch_cmd(client, message):
 
 
 async def link_handler(client, message):
+    if (message.text or "").startswith(AUTO_MARK):     # posted by /auto itself
+        return
     links = all_links(message.text or "")
     if not links:
         return
@@ -553,8 +640,9 @@ async def main():
     app.add_handler(MessageHandler(cleardest_cmd, private & filters.command("cleardest")))
     app.add_handler(MessageHandler(queue_cmd, private & filters.command("queue")))
     app.add_handler(MessageHandler(cancel_cmd, private & filters.command("cancel")))
+    app.add_handler(MessageHandler(auto_cmd, private & filters.command("auto")))
     app.add_handler(MessageHandler(batch_cmd, private & filters.command("batch")))
-    app.add_handler(MessageHandler(link_handler, private & filters.text & ~filters.command(["start", "setdest", "mydest", "cleardest", "queue", "batch", "cancel"])))
+    app.add_handler(MessageHandler(link_handler, private & filters.text & ~filters.command(["start", "setdest", "mydest", "cleardest", "queue", "batch", "cancel", "auto"])))
     app.add_handler(MessageHandler(media_handler, private & media))
     if not USER_MODE:
         app.add_handler(MessageHandler(deny_handler, filters.private & ~owner))
