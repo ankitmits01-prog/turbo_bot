@@ -24,7 +24,7 @@ from pyrogram.session.auth import Auth
 
 log = logging.getLogger("turbo")
 
-SESSIONS = int(os.getenv("TURBO_SESSIONS", "8"))      # connections per DC
+SESSIONS = int(os.getenv("TURBO_SESSIONS", "4"))      # connections per DC
 INFLIGHT = int(os.getenv("TURBO_INFLIGHT", "3"))      # requests in flight per connection
 DL_CHUNK = 1024 * 1024                                # max allowed for upload.GetFile
 UL_CHUNK = 512 * 1024                                 # max allowed for SaveBigFilePart
@@ -105,7 +105,10 @@ async def _invoke_retry(session, query):
         try:
             return await session.invoke(query)
         except FloodWait as e:
-            await asyncio.sleep(getattr(e, "value", 1) + 1)
+            wait = getattr(e, "value", 1)
+            if wait > 60:          # long ban: fail fast, let the bot pause everything
+                raise
+            await asyncio.sleep(wait + 1)
             last = e
         except asyncio.CancelledError:
             raise
@@ -184,6 +187,8 @@ async def turbo_download(client: Client, file_id: str, file_size: int, dest_path
 
     try:
         await _run_workers(SESSIONS * INFLIGHT, worker)
+    except asyncio.CancelledError:
+        raise
     except BaseException:
         # a broken pool is the usual cause of repeated failures; rebuild next time
         await drop_pool(fid.dc_id)
@@ -264,6 +269,8 @@ async def _turbo_save_file(
 
     try:
         await _run_workers(SESSIONS * INFLIGHT, worker)
+    except asyncio.CancelledError:
+        raise
     except BaseException:
         await drop_pool(await self.storage.dc_id())
         raise
@@ -359,6 +366,8 @@ async def _relay(self: Client, rf: RelayFile, progress, progress_args):
 
     try:
         await _run_workers(SESSIONS * INFLIGHT, worker)
+    except asyncio.CancelledError:
+        raise
     except BaseException:
         await drop_pool(fid.dc_id)
         await drop_pool(home_dc)
