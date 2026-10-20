@@ -20,11 +20,22 @@ from pathlib import PurePath
 
 from pyrogram import Client, raw
 from pyrogram.errors import AuthBytesInvalid, FloodWait
+try:
+    from pyrogram.errors import FloodPremiumWait
+except ImportError:                    # older forks
+    FloodPremiumWait = FloodWait
+FLOOD_ERRORS = (FloodWait, FloodPremiumWait)
 from pyrogram.file_id import FileId, FileType
 from pyrogram.session import Session
 from pyrogram.session.auth import Auth
 
 log = logging.getLogger("turbo")
+
+try:                                   # settings in .env must be visible before we read them below
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 SESSIONS = int(os.getenv("TURBO_SESSIONS", "4"))      # connections per DC
 INFLIGHT = int(os.getenv("TURBO_INFLIGHT", "3"))
@@ -82,36 +93,45 @@ async def _build_pool(client: Client, dc_id: int, n: int):
 
 
 async def get_pool(client: Client, dc_id: int):
-    lock = _pool_locks.setdefault(dc_id, asyncio.Lock())
+    key = (id(client), dc_id)
+    lock = _pool_locks.setdefault(key, asyncio.Lock())
     async with lock:
-        pool = _pools.get(dc_id)
+        pool = _pools.get(key)
         if pool is None:
             pool = await _build_pool(client, dc_id, SESSIONS)
-            _pools[dc_id] = pool
+            _pools[key] = pool
         return pool
 
 
-async def drop_pool(dc_id: int):
-    pool = _pools.pop(dc_id, None)
+async def drop_pool(client: Client, dc_id: int):
+    pool = _pools.pop((id(client), dc_id), None)
     if pool:
         await asyncio.gather(*(s.stop() for s in pool), return_exceptions=True)
 
 
 async def close_all():
-    for dc in list(_pools):
-        await drop_pool(dc)
+    for key in list(_pools):
+        pool = _pools.pop(key, None)
+        if pool:
+            await asyncio.gather(*(s.stop() for s in pool), return_exceptions=True)
 
 
 class Limiter:
     """
-    Adaptive concurrency limiter. Telegram answers "FloodWait" when too many chunk requests
-    arrive at once. On a flood we halve the number of simultaneous requests and pause ALL
-    workers together (no thundering herd); after a clean streak we slowly speed up again.
+    Adaptive concurrency limiter. When Telegram answers with a flood wait we (once per burst):
+    pause ALL workers together, remember the level that caused it as a ceiling, and drop below it.
+    We then creep back up to just under that ceiling and only probe higher after a few quiet
+    minutes - so we hover just under what Telegram tolerates instead of hitting the wall again
+    and again.
     """
+
+    PROBE_EVERY = 180      # seconds of clean running before trying one level higher
 
     def __init__(self, name: str, maxn: int):
         self.name, self.max, self.limit = name, maxn, maxn
-        self.floor = max(4, maxn // 4)
+        self.floor = max(2, maxn // 4)
+        self.ceiling = maxn
+        self.ceiling_t = time.monotonic()
         self.active = 0
         self.ok_streak = 0
         self.blocked_until = 0.0
@@ -131,17 +151,24 @@ class Limiter:
         self.active -= 1
 
     def on_ok(self):
+        now = time.monotonic()
+        if self.ceiling < self.max and now - self.ceiling_t > self.PROBE_EVERY:
+            self.ceiling += 1                      # quiet for a while: allow probing one level higher
+            self.ceiling_t = now
         self.ok_streak += 1
-        if self.ok_streak >= 8 and self.limit < self.max:
+        if self.ok_streak >= 8 and self.limit < min(self.ceiling, self.max):
             self.limit += 1
             self.ok_streak = 0
 
-    def on_flood(self, seconds: float):
-        if time.monotonic() >= self.blocked_until:        # halve ONCE per flood burst, not once per request
-            self.limit = max(self.floor, self.limit // 2)
+    def on_flood(self, seconds: float, kind: str = "FloodWait"):
+        now = time.monotonic()
+        if now >= self.blocked_until:              # first flood of this burst only
+            self.ceiling = max(self.floor, self.limit - 1)
+            self.ceiling_t = now
+            self.limit = max(self.floor, int(self.limit * 0.6))
         self.ok_streak = 0
-        self.blocked_until = max(self.blocked_until, time.monotonic() + seconds + 1 + random.random())
-        log.warning("FloodWait %ss on %s -> parallel requests now %s", seconds, self.name, self.limit)
+        self.blocked_until = max(self.blocked_until, now + seconds + 1 + random.random())
+        log.warning("%s %ss on %s -> parallel requests now %s (ceiling %s)", kind, seconds, self.name, self.limit, self.ceiling)
 
 
 DL_LIM = Limiter("download", SESSIONS * INFLIGHT)
@@ -174,13 +201,13 @@ async def _invoke_retry(session, query, limiter: "Limiter" = None):
             if limiter:
                 limiter.on_ok()
             return r
-        except FloodWait as e:
+        except FLOOD_ERRORS as e:
             floods += 1
             wait = getattr(e, "value", 1)
             if wait > 120 or floods > 40:      # long ban: fail fast, bot pauses everything
                 raise
             if limiter:
-                limiter.on_flood(wait)
+                limiter.on_flood(wait, type(e).__name__)
             else:
                 await asyncio.sleep(wait + 1)
         except asyncio.CancelledError:
@@ -229,7 +256,7 @@ async def turbo_download(client: Client, file_id: str, file_size: int, dest_path
             pool = await get_pool(client, fid.dc_id)
             break
         except Exception:
-            await drop_pool(fid.dc_id)
+            await drop_pool(client, fid.dc_id)
             if build_try == 1:
                 raise
 
@@ -270,7 +297,7 @@ async def turbo_download(client: Client, file_id: str, file_size: int, dest_path
         raise
     except BaseException:
         # a broken pool is the usual cause of repeated failures; rebuild next time
-        await drop_pool(fid.dc_id)
+        await drop_pool(client, fid.dc_id)
         raise
     finally:
         os.close(fd)
@@ -352,7 +379,7 @@ async def _turbo_save_file(
     except asyncio.CancelledError:
         raise
     except BaseException:
-        await drop_pool(await self.storage.dc_id())
+        await drop_pool(self, await self.storage.dc_id())
         raise
     finally:
         os.close(fd)
@@ -371,14 +398,16 @@ class RelayFile(io.IOBase):
     uploaded the moment it arrives, so total time ~ max(download, upload), not the sum.
     """
 
-    def __init__(self, file_id: str, file_size: int, name: str):
+    def __init__(self, file_id: str, file_size: int, name: str, src_client=None):
         super().__init__()
         self.file_id = file_id
         self.file_size = file_size
         self.name = name
+        self.src_client = src_client      # account that can read the source (None = same account)
 
 
 async def _relay(self: Client, rf: RelayFile, progress, progress_args):
+    src = rf.src_client or self           # downloads use `src`, uploads use `self`
     fid = FileId.decode(rf.file_id)
     size = rf.file_size
     limit_mib = 4000 if getattr(self.me, "is_premium", False) else 2000
@@ -392,7 +421,9 @@ async def _relay(self: Client, rf: RelayFile, progress, progress_args):
         thumb_size=fid.thumbnail_size,
     )
     home_dc = await self.storage.dc_id()
-    dl_pool = await get_pool(self, fid.dc_id)
+    log.info("Relay %.0f MB: source file on DC%s -> upload via DC%s%s", size / 1048576, fid.dc_id, home_dc,
+             " (2 accounts)" if src is not self else "")
+    dl_pool = await get_pool(src, fid.dc_id)
     ul_pool = await get_pool(self, home_dc)
 
     total_dl = math.ceil(size / DL_CHUNK)
@@ -450,8 +481,8 @@ async def _relay(self: Client, rf: RelayFile, progress, progress_args):
     except asyncio.CancelledError:
         raise
     except BaseException:
-        await drop_pool(fid.dc_id)
-        await drop_pool(home_dc)
+        await drop_pool(src, fid.dc_id)
+        await drop_pool(self, home_dc)
         raise
     await report(final=True)
     return raw.types.InputFileBig(id=big_id, parts=total_parts, name=rf.name)
@@ -464,4 +495,5 @@ def install(client_cls=Client):
         return
     _original_save_file = client_cls.save_file
     client_cls.save_file = _turbo_save_file
-    log.info("Turbo upload engine installed (%s sessions x %s in flight)", SESSIONS, INFLIGHT)
+    log.info("Turbo settings ACTIVE: sessions=%s inflight=%s adaptive=%s (pyrogram no-sleep supported: %s)",
+             SESSIONS, INFLIGHT, ADAPTIVE, _CAN_NO_SLEEP)
