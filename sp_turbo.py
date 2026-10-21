@@ -1,18 +1,23 @@
 """
 turbo.py - multi-session parallel download + upload engine for Pyrogram / Pyrofork.
 
-Why it is fast:
-  * Telegram throttles each MTProto connection, so we open several sessions
-    to the same DC and spread the chunks across all of them.
-  * Several requests are kept in flight on every session (pipelining).
-  * Chunks are written/read with pwrite/pread, so nothing blocks the event loop.
-  * Failed chunks are retried (the old patch silently dropped them).
+Why it is fast
+  * Telegram throttles each MTProto connection, so we open several sessions to the same DC
+    and spread the chunks across all of them (several requests in flight per session).
+  * RELAY mode: every 1 MB chunk is uploaded the moment it has been downloaded (no disk).
+  * Two accounts can share the work: one downloads (RelayFile.src_client), the other uploads.
+
+Why it stays fast (v3)
+  * A request that hangs is abandoned after TURBO_TIMEOUT seconds and re-sent on ANOTHER session
+    (before, a dead connection kept eating requests -> slow tails and "no speed at all").
+  * Sessions that went stale while the bot was idle are health-checked and restarted.
+  * End-game: when only a few chunks are left, idle workers duplicate them, first copy wins.
 """
 import asyncio
+import inspect
 import io
 import logging
 import math
-import inspect
 import os
 import random
 import time
@@ -37,29 +42,46 @@ try:                                   # settings in .env must be visible before
 except Exception:
     pass
 
-SESSIONS = int(os.getenv("TURBO_SESSIONS", "4"))      # connections per DC
-INFLIGHT = int(os.getenv("TURBO_INFLIGHT", "3"))
-ADAPTIVE = os.getenv("TURBO_ADAPTIVE", "0") == "1"    # 1 = auto-slow-down on FloodWait (off = original fast behaviour)      # requests in flight per connection
-DL_CHUNK = 1024 * 1024                                # max allowed for upload.GetFile
-UL_CHUNK = 512 * 1024                                 # max allowed for SaveBigFilePart
-BIG_FILE = 10 * 1024 * 1024                           # below this, use stock Pyrogram
+SESSIONS = int(os.getenv("TURBO_SESSIONS", "4"))              # connections per DC
+INFLIGHT = int(os.getenv("TURBO_INFLIGHT", "2"))              # requests in flight per connection
+ADAPTIVE = os.getenv("TURBO_ADAPTIVE", "0") == "1"            # 1 = auto-slow-down on flood waits
+REQ_TIMEOUT = float(os.getenv("TURBO_TIMEOUT", "12"))         # seconds before a hung request is re-sent
+DL_CHUNK = 1024 * 1024                                        # max allowed for upload.GetFile
+UL_CHUNK = 512 * 1024                                         # max allowed for SaveBigFilePart
+BIG_FILE = 10 * 1024 * 1024                                   # below this, use stock Pyrogram
 RETRIES = 6
 
+STATS = {"timeouts": 0, "dups": 0}
 _pools: dict = {}
 _pool_locks: dict = {}
+_pool_seen: dict = {}
+_auth_cache: dict = {}
 _original_save_file = None
+
+try:
+    _INV_PARAMS = set(inspect.signature(Session.invoke).parameters)
+except Exception:
+    _INV_PARAMS = set()
+_CAN_NO_SLEEP = "sleep_threshold" in _INV_PARAMS
+
+
+def _kw(**want):
+    """Only pass keyword args this Pyrogram version's Session.invoke understands."""
+    return {k: v for k, v in want.items() if k in _INV_PARAMS}
 
 
 # --------------------------------------------------------------------------
 # session pool
 # --------------------------------------------------------------------------
 async def _build_pool(client: Client, dc_id: int, n: int):
+    key = (id(client), dc_id)
     home_dc = await client.storage.dc_id()
     test_mode = await client.storage.test_mode()
     need_import = dc_id != home_dc
+    cached = need_import and key in _auth_cache
 
     if need_import:
-        auth_key = await Auth(client, dc_id, test_mode).create()
+        auth_key = _auth_cache[key] if cached else await Auth(client, dc_id, test_mode).create()
     else:
         auth_key = await client.storage.auth_key()
 
@@ -69,7 +91,7 @@ async def _build_pool(client: Client, dc_id: int, n: int):
         await first.start()
         sessions.append(first)
 
-        if need_import:
+        if need_import and not cached:
             for _ in range(3):
                 exported = await client.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
                 try:
@@ -81,6 +103,7 @@ async def _build_pool(client: Client, dc_id: int, n: int):
                     continue
             else:
                 raise AuthBytesInvalid
+            _auth_cache[key] = auth_key
 
         rest = [Session(client, dc_id, auth_key, test_mode, is_media=True) for _ in range(n - 1)]
         await asyncio.gather(*(s.start() for s in rest))
@@ -92,6 +115,31 @@ async def _build_pool(client: Client, dc_id: int, n: int):
     return sessions
 
 
+async def _ping(session) -> bool:
+    try:
+        await session.invoke(raw.functions.Ping(ping_id=random.getrandbits(31)), **_kw(retries=0, timeout=4))
+        return True
+    except Exception:
+        return False
+
+
+async def _heal(pool):
+    """Restart sessions that went stale (e.g. Telegram closed the idle connection)."""
+    ok = await asyncio.gather(*(_ping(s) for s in pool))
+    for s, good in zip(pool, ok):
+        if good:
+            continue
+        log.warning("Turbo: stale session found - restarting it")
+        try:
+            if hasattr(s, "restart"):
+                await s.restart()
+            else:
+                await s.stop()
+                await s.start()
+        except Exception as e:
+            log.warning("Turbo: session restart failed: %s", e)
+
+
 async def get_pool(client: Client, dc_id: int):
     key = (id(client), dc_id)
     lock = _pool_locks.setdefault(key, asyncio.Lock())
@@ -100,11 +148,17 @@ async def get_pool(client: Client, dc_id: int):
         if pool is None:
             pool = await _build_pool(client, dc_id, SESSIONS)
             _pools[key] = pool
+        elif time.monotonic() - _pool_seen.get(key, 0) > 8:      # was idle: make sure it still works
+            await _heal(pool)
+        _pool_seen[key] = time.monotonic()
         return pool
 
 
 async def drop_pool(client: Client, dc_id: int):
-    pool = _pools.pop((id(client), dc_id), None)
+    key = (id(client), dc_id)
+    pool = _pools.pop(key, None)
+    _auth_cache.pop(key, None)
+    _pool_seen.pop(key, None)
     if pool:
         await asyncio.gather(*(s.stop() for s in pool), return_exceptions=True)
 
@@ -114,18 +168,22 @@ async def close_all():
         pool = _pools.pop(key, None)
         if pool:
             await asyncio.gather(*(s.stop() for s in pool), return_exceptions=True)
+    _auth_cache.clear()
+    _pool_seen.clear()
 
 
+# --------------------------------------------------------------------------
+# adaptive limiter (only used when TURBO_ADAPTIVE=1)
+# --------------------------------------------------------------------------
 class Limiter:
     """
     Adaptive concurrency limiter. When Telegram answers with a flood wait we (once per burst):
     pause ALL workers together, remember the level that caused it as a ceiling, and drop below it.
     We then creep back up to just under that ceiling and only probe higher after a few quiet
-    minutes - so we hover just under what Telegram tolerates instead of hitting the wall again
-    and again.
+    minutes - so we hover just under what Telegram tolerates.
     """
 
-    PROBE_EVERY = 180      # seconds of clean running before trying one level higher
+    PROBE_EVERY = 60       # seconds of clean running before trying one level higher
 
     def __init__(self, name: str, maxn: int):
         self.name, self.max, self.limit = name, maxn, maxn
@@ -153,7 +211,7 @@ class Limiter:
     def on_ok(self):
         now = time.monotonic()
         if self.ceiling < self.max and now - self.ceiling_t > self.PROBE_EVERY:
-            self.ceiling += 1                      # quiet for a while: allow probing one level higher
+            self.ceiling += 1
             self.ceiling_t = now
         self.ok_streak += 1
         if self.ok_streak >= 8 and self.limit < min(self.ceiling, self.max):
@@ -174,26 +232,25 @@ class Limiter:
 DL_LIM = Limiter("download", SESSIONS * INFLIGHT)
 UL_LIM = Limiter("upload", SESSIONS * INFLIGHT)
 
-try:
-    _CAN_NO_SLEEP = "sleep_threshold" in inspect.signature(Session.invoke).parameters
-except Exception:
-    _CAN_NO_SLEEP = False
 
-
+# --------------------------------------------------------------------------
+# request helper: timeout -> re-send on ANOTHER session
+# --------------------------------------------------------------------------
 async def _call(session, query):
-    # sleep_threshold=0 makes pyrogram RAISE FloodWait instead of silently sleeping per request,
-    # so our Limiter can slow everything down at once.
-    if ADAPTIVE and _CAN_NO_SLEEP:
-        return await session.invoke(query, sleep_threshold=0)
-    return await session.invoke(query)
+    kw = _kw(retries=0, timeout=REQ_TIMEOUT)
+    if ADAPTIVE:
+        kw.update(_kw(sleep_threshold=0))      # raise FloodWait so the Limiter can slow everything down
+    return await session.invoke(query, **kw)
 
 
-async def _invoke_retry(session, query, limiter: "Limiter" = None):
+async def _invoke_retry(sessions, query, limiter: "Limiter" = None, start: int = 0):
+    if not isinstance(sessions, (list, tuple)):
+        sessions = [sessions]
     if not ADAPTIVE:
         limiter = None
     errors = floods = 0
-    last = None
     while True:
+        session = sessions[(start + errors) % len(sessions)]      # a failure moves us to the next session
         if limiter:
             await limiter.acquire()
         try:
@@ -214,42 +271,97 @@ async def _invoke_retry(session, query, limiter: "Limiter" = None):
             raise
         except Exception as e:                 # timeouts, connection resets, etc.
             errors += 1
-            last = e
+            STATS["timeouts"] += 1
             if errors >= RETRIES:
-                raise last
-            await asyncio.sleep(min(errors, 5))
+                raise
+            log.debug("request failed on a session (%s: %s) - trying another", type(e).__name__, e)
+            await asyncio.sleep(min(0.3 * errors, 2))
         finally:
             if limiter:
                 limiter.release()
 
 
-async def _run_workers(count: int, worker):
+# --------------------------------------------------------------------------
+# chunk scheduling with end-game duplication
+# --------------------------------------------------------------------------
+class Chunks:
+    def __init__(self, total: int):
+        self.total = total
+        self.next = 0
+        self.claims = {}
+        self.finished = set()
+        self.done_evt = asyncio.Event()
+        if total == 0:
+            self.done_evt.set()
+
+    async def claim(self):
+        """Next chunk index; at the end, a chunk someone else is still working on (first copy wins)."""
+        while True:
+            if self.next < self.total:
+                c = self.next
+                self.next += 1
+            else:
+                if len(self.finished) >= self.total:
+                    return None
+                pend = [k for k, n in self.claims.items() if k not in self.finished and n < 2]
+                if not pend:
+                    await asyncio.sleep(0.05)
+                    continue
+                c = random.choice(pend)
+                STATS["dups"] += 1
+            self.claims[c] = self.claims.get(c, 0) + 1
+            return c
+
+    def finish(self, c: int) -> bool:
+        if c in self.finished:
+            return False
+        self.finished.add(c)
+        if len(self.finished) >= self.total:
+            self.done_evt.set()
+        return True
+
+
+async def _run_workers(count: int, worker, done: asyncio.Event):
+    """Run workers until every chunk is finished; cancel stragglers; surface the first error."""
     loop = asyncio.get_running_loop()
-    tasks = [loop.create_task(worker(i)) for i in range(count)]
+    tasks = {loop.create_task(worker(i)) for i in range(count)}
+    waiter = loop.create_task(done.wait())
+    pending = set(tasks) | {waiter}
     try:
-        await asyncio.gather(*tasks)
-    except BaseException:
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+        while pending:
+            finished, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for t in finished:
+                if t is waiter:
+                    return
+                exc = t.exception()
+                if exc:
+                    raise exc
+    finally:
+        everything = tasks | {waiter}
+        for t in everything:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*everything, return_exceptions=True)
+
+
+def _location(fid):
+    return raw.types.InputDocumentFileLocation(
+        id=fid.media_id,
+        access_hash=fid.access_hash,
+        file_reference=fid.file_reference,
+        thumb_size=fid.thumbnail_size,
+    )
 
 
 # --------------------------------------------------------------------------
-# parallel download
+# parallel download to disk (fallback path)
 # --------------------------------------------------------------------------
 async def turbo_download(client: Client, file_id: str, file_size: int, dest_path: str, prog=None):
     """Download a Telegram document/video/audio into dest_path using many sessions."""
     fid = FileId.decode(file_id)
     if fid.file_type in (FileType.PHOTO, FileType.CHAT_PHOTO):
         raise ValueError("turbo_download only handles documents/videos/audio")
-
-    location = raw.types.InputDocumentFileLocation(
-        id=fid.media_id,
-        access_hash=fid.access_hash,
-        file_reference=fid.file_reference,
-        thumb_size=fid.thumbnail_size,
-    )
+    location = _location(fid)
 
     for build_try in range(2):
         try:
@@ -261,43 +373,37 @@ async def turbo_download(client: Client, file_id: str, file_size: int, dest_path
                 raise
 
     loop = asyncio.get_running_loop()
-    total_parts = math.ceil(file_size / DL_CHUNK)
-    state = {"next": 0}
+    total = math.ceil(file_size / DL_CHUNK)
+    chunks = Chunks(total)
 
     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
     fd = os.open(dest_path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
     os.ftruncate(fd, file_size)
 
     async def worker(idx):
-        session = pool[idx % len(pool)]
         while True:
-            part = state["next"]
-            if part >= total_parts:
+            c = await chunks.claim()
+            if c is None:
                 return
-            state["next"] += 1
-            offset = part * DL_CHUNK
+            offset = c * DL_CHUNK
             r = await _invoke_retry(
-                session,
-                raw.functions.upload.GetFile(location=location, offset=offset, limit=DL_CHUNK),
-                DL_LIM,
+                pool, raw.functions.upload.GetFile(location=location, offset=offset, limit=DL_CHUNK), DL_LIM, idx
             )
             if not isinstance(r, raw.types.upload.File):
                 raise RuntimeError("CDN redirect not supported, use normal download")
             data = r.bytes
-            expected = min(DL_CHUNK, file_size - offset)
-            if len(data) < expected:
-                raise RuntimeError(f"Short chunk at part {part}: {len(data)} < {expected}")
+            if len(data) < min(DL_CHUNK, file_size - offset):
+                raise RuntimeError(f"Short chunk at part {c}: {len(data)}")
             await loop.run_in_executor(None, os.pwrite, fd, data, offset)
-            if prog is not None:
+            if chunks.finish(c) and prog is not None:
                 prog.done += len(data)
 
     try:
-        await _run_workers(SESSIONS * INFLIGHT, worker)
+        await _run_workers(SESSIONS * INFLIGHT, worker, chunks.done_evt)
     except asyncio.CancelledError:
         raise
     except BaseException:
-        # a broken pool is the usual cause of repeated failures; rebuild next time
-        await drop_pool(client, fid.dc_id)
+        await drop_pool(client, fid.dc_id)     # a broken pool is the usual cause of repeated failures
         raise
     finally:
         os.close(fd)
@@ -307,6 +413,20 @@ async def turbo_download(client: Client, file_id: str, file_size: int, dest_path
 # --------------------------------------------------------------------------
 # parallel upload (patches Client.save_file, so send_video/send_document use it)
 # --------------------------------------------------------------------------
+def _reporter(progress, progress_args, size, state):
+    async def report(final=False):
+        if progress is None:
+            return
+        now = time.monotonic()
+        if not final and now - state["last_report"] < 0.5:
+            return
+        state["last_report"] = now
+        res = progress(min(state["done"], size), size, *progress_args)
+        if asyncio.iscoroutine(res):
+            await res
+    return report
+
+
 async def _turbo_save_file(
     self: Client,
     path,
@@ -336,50 +456,39 @@ async def _turbo_save_file(
     total_parts = math.ceil(file_size / UL_CHUNK)
     big_id = self.rnd_id()
     name = os.path.basename(path)
-    pool = await get_pool(self, await self.storage.dc_id())
+    home_dc = await self.storage.dc_id()
+    pool = await get_pool(self, home_dc)
 
     loop = asyncio.get_running_loop()
     fd = os.open(path, os.O_RDONLY)
-    state = {"next": 0, "done": 0, "last_report": 0.0}
-
-    async def report(final=False):
-        if progress is None:
-            return
-        now = time.monotonic()
-        if not final and now - state["last_report"] < 0.5:
-            return
-        state["last_report"] = now
-        res = progress(min(state["done"], file_size), file_size, *progress_args)
-        if asyncio.iscoroutine(res):
-            await res
+    state = {"done": 0, "last_report": 0.0}
+    report = _reporter(progress, progress_args, file_size, state)
+    chunks = Chunks(total_parts)
 
     async def worker(idx):
-        session = pool[idx % len(pool)]
         while True:
-            part = state["next"]
-            if part >= total_parts:
+            c = await chunks.claim()
+            if c is None:
                 return
-            state["next"] += 1
-            data = await loop.run_in_executor(None, os.pread, fd, UL_CHUNK, part * UL_CHUNK)
+            data = await loop.run_in_executor(None, os.pread, fd, UL_CHUNK, c * UL_CHUNK)
             await _invoke_retry(
-                session,
+                pool,
                 raw.functions.upload.SaveBigFilePart(
-                    file_id=big_id,
-                    file_part=part,
-                    file_total_parts=total_parts,
-                    bytes=data,
+                    file_id=big_id, file_part=c, file_total_parts=total_parts, bytes=data
                 ),
                 UL_LIM,
+                idx,
             )
-            state["done"] += len(data)
-            await report()
+            if chunks.finish(c):
+                state["done"] += len(data)
+                await report()
 
     try:
-        await _run_workers(SESSIONS * INFLIGHT, worker)
+        await _run_workers(SESSIONS * INFLIGHT, worker, chunks.done_evt)
     except asyncio.CancelledError:
         raise
     except BaseException:
-        await drop_pool(self, await self.storage.dc_id())
+        await drop_pool(self, home_dc)
         raise
     finally:
         os.close(fd)
@@ -414,12 +523,7 @@ async def _relay(self: Client, rf: RelayFile, progress, progress_args):
     if size > limit_mib * 1024 * 1024:
         raise ValueError(f"Can't upload files bigger than {limit_mib} MiB")
 
-    location = raw.types.InputDocumentFileLocation(
-        id=fid.media_id,
-        access_hash=fid.access_hash,
-        file_reference=fid.file_reference,
-        thumb_size=fid.thumbnail_size,
-    )
+    location = _location(fid)
     home_dc = await self.storage.dc_id()
     log.info("Relay %.0f MB: source file on DC%s -> upload via DC%s%s", size / 1048576, fid.dc_id, home_dc,
              " (2 accounts)" if src is not self else "")
@@ -429,30 +533,19 @@ async def _relay(self: Client, rf: RelayFile, progress, progress_args):
     total_dl = math.ceil(size / DL_CHUNK)
     total_parts = math.ceil(size / UL_CHUNK)
     big_id = self.rnd_id()
-    state = {"next": 0, "done": 0, "last_report": 0.0}
-
-    async def report(final=False):
-        if progress is None:
-            return
-        now = time.monotonic()
-        if not final and now - state["last_report"] < 0.5:
-            return
-        state["last_report"] = now
-        res = progress(min(state["done"], size), size, *progress_args)
-        if asyncio.iscoroutine(res):
-            await res
+    state = {"done": 0, "last_report": 0.0}
+    report = _reporter(progress, progress_args, size, state)
+    chunks = Chunks(total_dl)
+    t0, s0 = time.monotonic(), dict(STATS)
 
     async def worker(idx):
-        dls = dl_pool[idx % len(dl_pool)]
-        uls = ul_pool[(idx + 1) % len(ul_pool)]
         while True:
-            c = state["next"]
-            if c >= total_dl:
+            c = await chunks.claim()
+            if c is None:
                 return
-            state["next"] += 1
             offset = c * DL_CHUNK
             r = await _invoke_retry(
-                dls, raw.functions.upload.GetFile(location=location, offset=offset, limit=DL_CHUNK), DL_LIM
+                dl_pool, raw.functions.upload.GetFile(location=location, offset=offset, limit=DL_CHUNK), DL_LIM, idx
             )
             if not isinstance(r, raw.types.upload.File):
                 raise RuntimeError("CDN redirect not supported")
@@ -461,7 +554,7 @@ async def _relay(self: Client, rf: RelayFile, progress, progress_args):
                 raise RuntimeError(f"Short chunk at {offset}")
             ops = [
                 _invoke_retry(
-                    uls,
+                    ul_pool,
                     raw.functions.upload.SaveBigFilePart(
                         file_id=big_id,
                         file_part=(offset + k) // UL_CHUNK,
@@ -469,15 +562,17 @@ async def _relay(self: Client, rf: RelayFile, progress, progress_args):
                         bytes=data[k:k + UL_CHUNK],
                     ),
                     UL_LIM,
+                    idx + 1 + k // UL_CHUNK,
                 )
                 for k in range(0, len(data), UL_CHUNK)
             ]
             await asyncio.gather(*ops)
-            state["done"] += len(data)
-            await report()
+            if chunks.finish(c):
+                state["done"] += len(data)
+                await report()
 
     try:
-        await _run_workers(SESSIONS * INFLIGHT, worker)
+        await _run_workers(SESSIONS * INFLIGHT, worker, chunks.done_evt)
     except asyncio.CancelledError:
         raise
     except BaseException:
@@ -485,6 +580,10 @@ async def _relay(self: Client, rf: RelayFile, progress, progress_args):
         await drop_pool(self, home_dc)
         raise
     await report(final=True)
+    took = max(time.monotonic() - t0, 0.001)
+    log.info("Relay done: %.0f MB in %.0fs (%.1f MB/s) | re-sent after timeout: %d | end-game duplicates: %d",
+             size / 1048576, took, size / 1048576 / took,
+             STATS["timeouts"] - s0["timeouts"], STATS["dups"] - s0["dups"])
     return raw.types.InputFileBig(id=big_id, parts=total_parts, name=rf.name)
 
 
@@ -495,5 +594,5 @@ def install(client_cls=Client):
         return
     _original_save_file = client_cls.save_file
     client_cls.save_file = _turbo_save_file
-    log.info("Turbo settings ACTIVE: sessions=%s inflight=%s adaptive=%s (pyrogram no-sleep supported: %s)",
-             SESSIONS, INFLIGHT, ADAPTIVE, _CAN_NO_SLEEP)
+    log.info("Turbo settings ACTIVE: sessions=%s inflight=%s adaptive=%s timeout=%ss (no-sleep supported: %s)",
+             SESSIONS, INFLIGHT, ADAPTIVE, REQ_TIMEOUT, _CAN_NO_SLEEP)
