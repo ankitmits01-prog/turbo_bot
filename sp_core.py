@@ -130,6 +130,17 @@ async def batch_reporter(batch: "Batch"):
 
 
 # ---------------------------------------------------------------- helpers
+LAST_ERRORS: list = []        # (time, link, "Type: message", traceback) of the last failed jobs
+
+
+def record_error(job, exc):
+    import traceback
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-1500:]
+    LAST_ERRORS.append((time.strftime("%H:%M:%S"), f"{job.get('src_chat')}/{job.get('src_mid')}",
+                        f"{type(exc).__name__}: {exc}", tb))
+    del LAST_ERRORS[:-5]
+
+
 def human(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024 or unit == "GB":
@@ -350,29 +361,87 @@ def rewrite_caption(text, entities, tag=None):
 
 
 # ---------------------------------------------------------------- core job
+def _restricted(msg) -> bool:
+    return bool(getattr(msg, "has_protected_content", False) or getattr(getattr(msg, "chat", None), "has_protected_content", False))
+
+
+def _is_restricted_error(e: Exception) -> bool:
+    text = str(e).upper()
+    return "RESTRICT" in text or "PROTECTED" in text or "FORWARDS" in text
+
+
+async def _copy(client: Client, to_chat, src_chat, msg_id, kw: dict):
+    """Server-side copy (no download/upload). If Telegram rejects our caption formatting, keep the text only."""
+    try:
+        return await flood_safe(client.copy_message, to_chat, src_chat, msg_id, **kw)
+    except Exception as e:
+        if kw and "ENTITY" in str(e).upper():
+            kw = {k: v for k, v in kw.items() if k != "caption_entities"}
+            return await flood_safe(client.copy_message, to_chat, src_chat, msg_id, **kw)
+        raise
+
+
+def _caption_kw(msg) -> dict:
+    new_cap, new_ents, changed = rewrite_caption(msg.caption, msg.caption_entities)
+    return dict(caption=new_cap, caption_entities=new_ents or None, parse_mode=ParseMode.DISABLED) if changed else {}
+
+
 async def fast_copy(client: Client, dest, src_chat, msg) -> bool:
     """Server-side copy. Returns True on success, False if content is restricted."""
-    if getattr(msg, "has_protected_content", False) or getattr(msg.chat, "has_protected_content", False):
+    if _restricted(msg):
         return False
     try:
-        kw = {}
-        new_cap, new_ents, changed = rewrite_caption(msg.caption, msg.caption_entities)
-        if changed:
-            kw = dict(caption=new_cap, caption_entities=new_ents or None, parse_mode=ParseMode.DISABLED)
-        try:
-            await flood_safe(client.copy_message, dest, src_chat, msg.id, **kw)
-        except Exception as e:
-            if kw and "ENTITY" in str(e).upper():       # formatting bounds rejected: keep our text, drop formatting
-                kw.pop("caption_entities", None)
-                await flood_safe(client.copy_message, dest, src_chat, msg.id, **kw)
-            else:
-                raise
+        await _copy(client, dest, src_chat, msg.id, _caption_kw(msg))
         return True
     except Exception as e:
-        text = str(e).upper()
-        if "RESTRICT" in text or "PROTECTED" in text or "FORWARDS" in text:
+        if _is_restricted_error(e):
             return False
         raise
+
+
+_direct_bad: dict = {}      # (download account, destination) -> when it could not post there
+
+
+async def fast_copy_split(ul: Client, dl: Client, dest, src_chat, msg, transit=None) -> bool:
+    """
+    Instant copy when two different accounts are used (nothing is downloaded or uploaded):
+      1) the download account posts straight into the destination (works if it is a member/admin there)
+      2) else: download account -> private TRANSIT chat that both accounts are in -> upload account -> destination
+    Returns False (caller falls back to the normal download+upload relay) for restricted content or any problem.
+    """
+    if _restricted(msg):
+        return False
+    kw = _caption_kw(msg)                         # caption rewrite happens in the first copy
+
+    key = (id(dl), dest)
+    if time.monotonic() - _direct_bad.get(key, -1e9) > 600:
+        try:
+            await _copy(dl, dest, src_chat, msg.id, kw)
+            return True
+        except Exception as e:
+            if _is_restricted_error(e):
+                return False
+            _direct_bad[key] = time.monotonic()   # this account can't post in the destination - don't retry for 10 min
+            log.info("direct copy not possible (%s: %s)", type(e).__name__, e)
+
+    if transit:
+        sent = None
+        try:
+            sent = await _copy(dl, transit, src_chat, msg.id, kw)
+            await _copy(ul, dest, transit, sent.id, {})
+            return True
+        except Exception as e:
+            if _is_restricted_error(e):
+                return False
+            log.warning("copy via transit failed (%s: %s) - using the normal relay", type(e).__name__, e)
+            return False
+        finally:
+            if sent is not None:
+                try:
+                    await dl.delete_messages(transit, sent.id)
+                except Exception:
+                    pass
+    return False
 
 
 async def slow_transfer(client: Client, dest, msg, prog: Prog, job_dir: Path, dl_client: Client = None, extra_dl=None):
@@ -494,7 +563,9 @@ async def run_job(client: Client, job: dict):
             raise RuntimeError("Message empty/deleted hai ya accessible nahi.")
 
         dest = job["dest"]
-        if dl is client and await fast_copy(client, dest, job["src_chat"], msg):
+        instant = (await fast_copy(client, dest, job["src_chat"], msg) if dl is client
+                   else await fast_copy_split(client, dl, dest, job["src_chat"], msg, job.get("transit")))
+        if instant:
             await say(f"✅ Copied instantly in {time.monotonic() - t0:.1f}s")
             job["result"] = "ok"
             if batch:
@@ -519,12 +590,13 @@ async def run_job(client: Client, job: dict):
         raise
     except Exception as e:
         job["result"] = "fail"
+        record_error(job, e)
         log.exception("job failed")
         if isinstance(e, FloodWait):
             flood_until = max(flood_until, time.monotonic() + e.value + 2)
             await say(f"⏳ FloodWait {e.value}s - bot itni der ruk kar aage badhega")
         else:
-            await say(f"❌ Failed: {e}")
+            await say(f"❌ Failed: {type(e).__name__}: {e}")
         if batch:
             batch.fail += 1
             batch.last_error = str(e)
